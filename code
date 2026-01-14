@@ -1,0 +1,430 @@
+# =========================
+# Public Attention Signals - Minimal Research Pipeline
+# =========================
+
+import time
+import datetime as dt
+import requests
+import numpy as np
+import pandas as pd
+
+import yfinance as yf
+from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+from sklearn.metrics import (
+    mean_absolute_error, r2_score,
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+)
+
+# Optional dependencies (guarded imports)
+try:
+    from pytrends.request import TrendReq
+    HAS_TRENDS = True
+except Exception:
+    HAS_TRENDS = False
+
+# -------------------------
+# CONFIG
+# -------------------------
+CFG = {
+    "include_google_trends": False,   # requires pytrends + rate limits
+    "alpha_vantage_key": None,        # set string key or leave None
+    "fred_key": None,                 # set string key or leave None
+    "lookback_days": 180,
+    "wiki_days": 180,
+    "horizon_days": 7,                # attention target horizon
+    "downside_horizon_days": 5,        # downside target horizon
+    "downside_threshold": -0.02,       # -2% within horizon
+    "rolling_z_window": 90,
+    "test_days": 30,                  # last N days used as out-of-sample
+    "max_wiki_workers": 10,
+    "user_agent": "AttentionResearchBot/1.0 (contact: your.email@example.com)",
+    "output_csv": "attention_predictions.csv"
+}
+
+TICKERS = [
+    "AAPL","MSFT","AMZN","GOOGL","META","TSLA","NVDA","BRK-B","UNH","JNJ",
+    "V","XOM","JPM","PG","HD","MA","CVX","ABBV","PFE","KO",
+    "PEP","BAC","LLY","AVGO","COST","MRK","WMT","DIS","CSCO","ACN",
+    "TMO","ABT","MCD","ADBE","NKE","CRM","NFLX","VZ","WFC","LIN",
+    "TXN","INTC","HON","PM","NEE","UNP","MS","RTX","LOW","GS",
+    "ORCL","IBM","AMD","CAT","BA","AMGN","MDT","CVS","C","SPGI",
+    "AXP","NOW","INTU","ISRG","LMT","PLD","DE","ADI","MDLZ","BKNG",
+    "ADP","GILD","SYK","BLK","MMC","QCOM","MO","REGN","SCHW","TGT",
+    "CI","ZTS","AMT","DUK","SO","PNC","USB","CME","BDX","CB",
+    "EQIX","NSC","ICE","GM","APD","CL","EL","GE","SHW","HCA"
+]
+
+# Wikipedia pages: use exact page titles. If missing, fallback to ticker (often fails).
+WIKI_PAGES = {t: t for t in TICKERS}
+# You should override with correct pages for ambiguous tickers, e.g.:
+# WIKI_PAGES["GE"] = "General_Electric"
+
+# -------------------------
+# HELPERS
+# -------------------------
+def _date_range(days: int):
+    end = dt.date.today()
+    start = end - dt.timedelta(days=days)
+    return start, end
+
+def fetch_market_data(tickers: list[str], lookback_days: int) -> pd.DataFrame:
+    start, end = _date_range(lookback_days)
+    rows = []
+    for t in tickers:
+        try:
+            hist = yf.Ticker(t).history(start=start, end=end, interval="1d").reset_index()
+            if hist.empty:
+                continue
+            hist = hist.rename(columns={"Date": "date", "Close": "close", "Volume": "volume"})
+            hist["ticker"] = t
+            hist["date"] = pd.to_datetime(hist["date"]).dt.date
+            rows.append(hist[["date", "ticker", "close", "volume"]])
+        except Exception as e:
+            print(f"[market] {t} error: {e}")
+    if not rows:
+        return pd.DataFrame(columns=["date", "ticker", "close", "volume"])
+    return pd.concat(rows, ignore_index=True)
+
+def fetch_vix(lookback_days: int) -> pd.DataFrame:
+    start, end = _date_range(lookback_days)
+    try:
+        hist = yf.Ticker("^VIX").history(start=start, end=end, interval="1d").reset_index()
+        if hist.empty:
+            return pd.DataFrame(columns=["date", "vix_close"])
+        hist = hist.rename(columns={"Date": "date", "Close": "vix_close"})
+        hist["date"] = pd.to_datetime(hist["date"]).dt.date
+        return hist[["date", "vix_close"]]
+    except Exception as e:
+        print(f"[vix] error: {e}")
+        return pd.DataFrame(columns=["date", "vix_close"])
+
+def fetch_wikipedia_pageviews(wiki_pages: dict[str, str], days: int, user_agent: str, max_workers: int) -> pd.DataFrame:
+    import concurrent.futures
+
+    start, end = _date_range(days)
+    start_s, end_s = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    headers = {"User-Agent": user_agent}
+
+    def _fetch_one(ticker: str, page: str):
+        url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/all-agents/{page}/daily/{start_s}/{end_s}"
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 404:
+                return []
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            out = []
+            for it in items:
+                ts = it.get("timestamp", "")[:8]
+                try:
+                    d = dt.datetime.strptime(ts, "%Y%m%d").date()
+                except Exception:
+                    continue
+                out.append({"date": d, "ticker": ticker, "wiki_views": int(it.get("views", 0))})
+            return out
+        except Exception:
+            return []
+
+    rows = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_fetch_one, t, p): t for t, p in wiki_pages.items()}
+        for fut in concurrent.futures.as_completed(futs):
+            rows.extend(fut.result())
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "ticker", "wiki_views"])
+    return pd.DataFrame(rows)
+
+def fetch_google_trends(tickers: list[str], days: int) -> pd.DataFrame:
+    # NOTE: pytrends is rate-limited and can be flaky. Keep optional.
+    if not HAS_TRENDS:
+        print("[trends] pytrends not available; skipping.")
+        return pd.DataFrame(columns=["date", "ticker", "gt_interest"])
+    pytrends = TrendReq(hl="en-US", tz=360)
+
+    # pytrends supports windows like "today 3-m"; mapping days approx:
+    timeframe = "today 3-m" if days <= 90 else "today 12-m"
+
+    rows = []
+    for t in tickers:
+        try:
+            pytrends.build_payload([t], timeframe=timeframe)
+            df = pytrends.interest_over_time()
+            if df is None or df.empty:
+                continue
+            df = df.reset_index()
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+            rows.append(pd.DataFrame({"date": df["date"], "ticker": t, "gt_interest": df[t].astype(float)}))
+            time.sleep(2)
+        except Exception as e:
+            print(f"[trends] {t} error: {e}")
+            time.sleep(10)
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "ticker", "gt_interest"])
+    return pd.concat(rows, ignore_index=True)
+
+def fetch_fred_unrate(api_key: str | None) -> pd.DataFrame:
+    if not api_key:
+        return pd.DataFrame(columns=["date", "unrate"])
+    base_url = "https://api.stlouisfed.org/fred/series/observations"
+    end = dt.date.today()
+    start = end - dt.timedelta(days=365 * 2)
+    params = {
+        "series_id": "UNRATE",
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": start.strftime("%Y-%m-%d"),
+        "observation_end": end.strftime("%Y-%m-%d"),
+    }
+    try:
+        r = requests.get(base_url, params=params, timeout=20)
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+        rows = []
+        for o in obs:
+            val = o.get("value")
+            if not val or val == ".":
+                continue
+            d = dt.datetime.strptime(o["date"], "%Y-%m-%d").date()
+            rows.append({"date": d, "unrate": float(val)})
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["date", "unrate"])
+    except Exception as e:
+        print(f"[fred] error: {e}")
+        return pd.DataFrame(columns=["date", "unrate"])
+
+def fetch_alpha_vantage_sentiment(tickers: list[str], api_key: str | None) -> pd.DataFrame:
+    # Optional; free tier is heavily rate-limited.
+    if not api_key:
+        return pd.DataFrame(columns=["date", "ticker", "avg_sentiment"])
+
+    rows = []
+    for t in tickers:
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={t}&apikey={api_key}"
+        try:
+            r = requests.get(url, timeout=25)
+            r.raise_for_status()
+            data = r.json()
+            feed = data.get("feed", [])
+            for item in feed:
+                ts = item.get("time_published", "")[:8]
+                if not ts:
+                    continue
+                try:
+                    d = dt.datetime.strptime(ts, "%Y%m%d").date()
+                except Exception:
+                    continue
+                rows.append({
+                    "date": d,
+                    "ticker": t,
+                    "avg_sentiment": float(item.get("overall_sentiment_score", 0.0))
+                })
+        except Exception as e:
+            print(f"[alpha] {t} error: {e}")
+        time.sleep(15)  # free tier throttle
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "ticker", "avg_sentiment"])
+    df = pd.DataFrame(rows)
+    return df.groupby(["date", "ticker"], as_index=False)["avg_sentiment"].mean()
+
+# -------------------------
+# FEATURE BUILDING
+# -------------------------
+def zscore_rolling_by_ticker(df: pd.DataFrame, col: str, window: int, out_col: str) -> pd.Series:
+    g = df.groupby("ticker")[col]
+    mu = g.transform(lambda s: s.rolling(window).mean())
+    sd = g.transform(lambda s: s.rolling(window).std())
+    return (df[col] - mu) / (sd + 1e-9)
+
+def build_dataset(
+    market: pd.DataFrame,
+    wiki: pd.DataFrame,
+    trends: pd.DataFrame,
+    vix: pd.DataFrame,
+    unrate: pd.DataFrame,
+    sentiment: pd.DataFrame,
+    cfg: dict
+) -> pd.DataFrame:
+    # Start from market to avoid creating meaningless outer-merge rows
+    df = market.copy()
+
+    # merges
+    if not wiki.empty:
+        df = df.merge(wiki, on=["date", "ticker"], how="left")
+    if not trends.empty:
+        df = df.merge(trends, on=["date", "ticker"], how="left")
+    if not sentiment.empty:
+        df = df.merge(sentiment, on=["date", "ticker"], how="left")
+    if not vix.empty:
+        df = df.merge(vix, on="date", how="left")
+    if not unrate.empty:
+        df = df.merge(unrate, on="date", how="left")
+
+    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    # Fill only truly missing numerical inputs (left merges)
+    for c in ["wiki_views", "gt_interest", "avg_sentiment", "vix_close", "unrate"]:
+        if c in df.columns:
+            df[c] = df[c].fillna(0.0)
+
+    # price features
+    df["ret_1d"] = df.groupby("ticker")["close"].pct_change().fillna(0.0)
+    df["vol_10d"] = df.groupby("ticker")["ret_1d"].transform(lambda s: s.rolling(10).std()).fillna(0.0)
+    df["mom_5d"] = df.groupby("ticker")["close"].pct_change(5).fillna(0.0)
+
+    # attention z-scores
+    win = cfg["rolling_z_window"]
+    if "wiki_views" in df.columns:
+        df["wiki_z"] = zscore_rolling_by_ticker(df, "wiki_views", win, "wiki_z").fillna(0.0)
+    else:
+        df["wiki_z"] = 0.0
+
+    if "gt_interest" in df.columns and df["gt_interest"].abs().sum() > 0:
+        df["gt_z"] = zscore_rolling_by_ticker(df, "gt_interest", win, "gt_z").fillna(0.0)
+    else:
+        df["gt_z"] = 0.0
+
+    if "avg_sentiment" in df.columns and df["avg_sentiment"].abs().sum() > 0:
+        df["sent_z"] = zscore_rolling_by_ticker(df, "avg_sentiment", win, "sent_z").fillna(0.0)
+    else:
+        df["sent_z"] = 0.0
+
+    if "vix_close" in df.columns and df["vix_close"].abs().sum() > 0:
+        df["vix_z"] = (df["vix_close"] - df["vix_close"].rolling(win).mean()) / (df["vix_close"].rolling(win).std() + 1e-9)
+        df["vix_z"] = df["vix_z"].fillna(0.0)
+    else:
+        df["vix_z"] = 0.0
+
+    if "unrate" in df.columns and df["unrate"].abs().sum() > 0:
+        df["unrate_z"] = (df["unrate"] - df["unrate"].rolling(win).mean()) / (df["unrate"].rolling(win).std() + 1e-9)
+        df["unrate_z"] = df["unrate_z"].fillna(0.0)
+    else:
+        df["unrate_z"] = 0.0
+
+    # consolidated attention signal (research feature, not "trading")
+    df["attn_today"] = df["wiki_z"] + df["gt_z"] + df["sent_z"]
+
+    # targets
+    h = cfg["horizon_days"]
+    df["attn_target"] = df.groupby("ticker")["attn_today"].shift(-h)
+
+    # downside target (within downside_horizon_days)
+    dh = cfg["downside_horizon_days"]
+    df["close_fwd"] = df.groupby("ticker")["close"].shift(-dh)
+    df["ret_fwd"] = (df["close_fwd"] / df["close"]) - 1.0
+    df["y_down"] = (df["ret_fwd"] <= cfg["downside_threshold"]).astype(int)
+
+    return df
+
+# -------------------------
+# TRAIN / EVAL (OUT-OF-SAMPLE)
+# -------------------------
+def time_split(df: pd.DataFrame, test_days: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # last N unique dates for test
+    dates = sorted(df["date"].unique())
+    if len(dates) <= test_days + 5:
+        raise ValueError("Not enough history for requested test_days.")
+    test_dates = set(dates[-test_days:])
+    train = df[~df["date"].isin(test_dates)].copy()
+    test = df[df["date"].isin(test_dates)].copy()
+    return train, test
+
+def train_attention_model(train: pd.DataFrame, feats: list[str]) -> HistGradientBoostingRegressor:
+    data = train.dropna(subset=["attn_target"])
+    X, y = data[feats], data["attn_target"]
+    return HistGradientBoostingRegressor().fit(X, y)
+
+def train_downside_model(train: pd.DataFrame, feats: list[str]) -> HistGradientBoostingClassifier:
+    data = train.dropna(subset=["ret_fwd"]).copy()
+    if data["y_down"].nunique() < 2:
+        raise ValueError("Downside target has <2 classes in training data.")
+    X, y = data[feats], data["y_down"]
+    return HistGradientBoostingClassifier().fit(X, y)
+
+def evaluate_attention(model, test: pd.DataFrame, feats: list[str]):
+    data = test.dropna(subset=["attn_target"])
+    if data.empty:
+        return None
+    pred = model.predict(data[feats])
+    return {
+        "MAE": float(mean_absolute_error(data["attn_target"], pred)),
+        "R2": float(r2_score(data["attn_target"], pred))
+    }
+
+def evaluate_downside(model, test: pd.DataFrame, feats: list[str]):
+    data = test.dropna(subset=["ret_fwd"])
+    if data.empty or data["y_down"].nunique() < 2:
+        return None
+    prob = model.predict_proba(data[feats])[:, 1]
+    pred = (prob > 0.5).astype(int)
+    return {
+        "Accuracy": float(accuracy_score(data["y_down"], pred)),
+        "Precision": float(precision_score(data["y_down"], pred, zero_division=0)),
+        "Recall": float(recall_score(data["y_down"], pred, zero_division=0)),
+        "F1": float(f1_score(data["y_down"], pred, zero_division=0)),
+        "ROC_AUC": float(roc_auc_score(data["y_down"], prob))
+    }
+
+# -------------------------
+# MAIN
+# -------------------------
+def main(cfg: dict):
+    # Fetch data
+    market = fetch_market_data(TICKERS, cfg["lookback_days"])
+    if market.empty:
+        raise RuntimeError("No market data fetched.")
+
+    vix = fetch_vix(cfg["lookback_days"])
+    wiki = fetch_wikipedia_pageviews(WIKI_PAGES, cfg["wiki_days"], cfg["user_agent"], cfg["max_wiki_workers"])
+
+    trends = pd.DataFrame(columns=["date", "ticker", "gt_interest"])
+    if cfg["include_google_trends"]:
+        trends = fetch_google_trends(TICKERS, cfg["wiki_days"])
+
+    unrate = fetch_fred_unrate(cfg["fred_key"])
+    sentiment = fetch_alpha_vantage_sentiment(TICKERS, cfg["alpha_vantage_key"])
+
+    # Build dataset
+    df = build_dataset(market, wiki, trends, vix, unrate, sentiment, cfg)
+
+    # Define features (explicit, research-safe)
+    feats = ["ret_1d", "vol_10d", "mom_5d", "wiki_z", "gt_z", "sent_z", "vix_z", "unrate_z", "attn_today"]
+
+    train, test = time_split(df, cfg["test_days"])
+
+    # Train models
+    attn_model = train_attention_model(train, feats)
+    attn_metrics = evaluate_attention(attn_model, test, feats)
+
+    downside_model = None
+    downside_metrics = None
+    try:
+        downside_model = train_downside_model(train, feats)
+        downside_metrics = evaluate_downside(downside_model, test, feats)
+    except Exception as e:
+        downside_metrics = {"note": f"Downside model not evaluated: {e}"}
+
+    # Predict latest day
+    latest = df.sort_values("date").groupby("ticker").tail(1).copy()
+    latest["attn_pred_h"] = attn_model.predict(latest[feats])
+
+    if downside_model is not None:
+        latest["prob_down"] = downside_model.predict_proba(latest[feats])[:, 1]
+    else:
+        latest["prob_down"] = np.nan
+
+    out = latest[["date", "ticker", "attn_today", "attn_pred_h", "prob_down"]].sort_values("attn_pred_h", ascending=False)
+    out.to_csv(cfg["output_csv"], index=False)
+
+    print("=== OUT-OF-SAMPLE METRICS ===")
+    print("Attention model:", attn_metrics if attn_metrics else "not available")
+    print("Downside model:", downside_metrics if downside_metrics else "not available")
+    print(f"\nSaved latest predictions to: {cfg['output_csv']}")
+    print("\nTop 15 by predicted attention:")
+    print(out.head(15).to_string(index=False))
+
+    return out, attn_metrics, downside_metrics
+
+if __name__ == "__main__":
+    main(CFG)
