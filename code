@@ -1,6 +1,4 @@
-# =========================
-# Public Attention Signals - Minimal Research Pipeline
-# =========================
+
 
 import time
 import datetime as dt
